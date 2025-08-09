@@ -21,7 +21,16 @@ form.addEventListener("submit", async (e) => {
       body: file
     });
 
-    const data = await res.json();
+    const ct = res.headers.get("content-type") || "";
+    let data;
+
+    if (ct.includes("application/json")) {
+      data = await res.json();
+    } else {
+      const text = await res.text();
+      throw new Error(text || `Server error (${res.status})`);
+    }
+
     if (!res.ok) {
       throw new Error(data?.error || `Server error (${res.status})`);
     }
@@ -68,6 +77,34 @@ function renderTeams(teams) {
       members.length ? members.map(sanitize).join(", ") : "<em>None</em>"
     }</p>`;
   }).join("");
+}
+
+function renderLocums(locums) {
+  const keys = Object.keys(locums || {});
+  if (!keys.length) return "";
+  const text = keys.map(k => `${sanitize(k)} (${sanitize(String(locums[k]))})`).join(" • ");
+  return `<p class="mt-2 text-danger"><strong>⚠️ Locum Required:</strong> ${text}</p>`;
+}
+
+function toast(msg, error=false) {
+  const el = document.createElement("div");
+  el.textContent = msg;
+  Object.assign(el.style, {
+    position: "fixed", left: "50%", transform: "translateX(-50%)",
+    bottom: "24px", padding: "10px 16px", borderRadius: "8px",
+    background: error ? "#dc3545" : "#198754", color: "#fff",
+    boxShadow: "0 6px 18px rgba(0,0,0,.2)", zIndex: 9999
+  });
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+function sanitize(str) {
+  return String(str).replace(/[&<>"']/g, m => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[m]));
+}
+
 }
 
 function renderLocums(locums) {
