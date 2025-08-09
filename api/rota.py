@@ -1,6 +1,20 @@
-import io, json, pandas as pd
-from collections import defaultdict
+# api/rota.py
+import json
 
+# --- Dependency import guard ---
+try:
+    import io
+    import pandas as pd
+    from collections import defaultdict
+except Exception as e:
+    def handler(request):
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": f"Dependency import failed: {str(e)}"})
+        }
+
+# --- Config ---
 SHEET_NAME = "SHO Rota"
 UNAVAILABLE_TOKENS = ["NIGHT", "ZERO", "AL"]
 REQUIRED = {"Team A": 2, "Team B": 3, "Team C": 1, "Team D": 1}
@@ -13,39 +27,29 @@ FIXED = {
 LOCUM_THRESHOLD = 7
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 
-def _read_bytes(request):
-    # Prefer raw bytes
-    data = getattr(request, "get_data", lambda: None)()
-    if not data and hasattr(request, "body"):
-        data = request.body
-    # Fallback to multipart if available
-    if (not data) and hasattr(request, "files"):
-        f = request.files.get("file")
-        if f:
-            data = f.read()
-    return data
-
-def cell_is_available(v):
-    if isinstance(v, str):
-        return not any(tok in v.upper() for tok in UNAVAILABLE_TOKENS)
+# --- Helpers ---
+def cell_is_available(val):
+    if isinstance(val, str):
+        return not any(tok in val.upper() for tok in UNAVAILABLE_TOKENS)
     return True
 
 def is_name_like(s):
     if not s or not isinstance(s, str):
         return False
     u = s.upper()
-    bad = ["TEAM","BLEEP","0800","0700","→","ZERO","NIGHT","AL","SECOND","LD","LC"]  # LC if it appears
-    if any(b in u for b in bad): return False
-    if "FY1" in u: return False
+    bad = ["TEAM", "BLEEP", "0800", "0700", "→", "ZERO", "NIGHT", "AL", "SECOND", "LD"]
+    if any(b in u for b in bad):
+        return False
+    if "FY1" in u:
+        return False
     return True
 
 def extract_parent_team_map(df):
-    parent, current_team = {}, None
-    first = df.columns[0]
-    name_col = df.columns[1] if len(df.columns) > 1 else first
+    parent = {}
+    current_team = None
     for _, row in df.iterrows():
-        team_cell = str(row.get(first, "")).strip()
-        name_cell = str(row.get(name_col, "")).strip()
+        team_cell = str(row.iloc[0]).strip()
+        name_cell = str(row.iloc[1]).strip() if len(row) > 1 else ""
         if team_cell.startswith("Team "):
             current_team = team_cell
         if current_team and is_name_like(name_cell):
@@ -53,12 +57,10 @@ def extract_parent_team_map(df):
     return parent
 
 def build_working_rota(df):
-    # Assumes names in col[1], Mon–Fri in col[4:9] (as per your template)
-    if len(df.columns) < 9:
-        raise ValueError("Expected at least 9 columns (Name + Mon–Fri).")
     name_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    cols = ["Name"] + WEEKDAYS
     work = df.loc[:, [name_col] + list(df.columns[4:9])].copy()
-    work.columns = ["Name"] + WEEKDAYS
+    work.columns = cols
     work = work.dropna(subset=["Name"])
     work = work[work["Name"].astype(str).apply(is_name_like)]
     work["Name"] = work["Name"].astype(str).str.strip()
@@ -69,30 +71,30 @@ def assign_for_day(avail_names, parent_map):
     teams = defaultdict(list)
     unassigned = names.copy()
 
-    # Fixed if available
+    # Fixed people
     for doc, team in FIXED.items():
         if doc in unassigned:
             teams[team].append(doc)
             unassigned.remove(doc)
 
-    # Prefer parent teams to meet minimums
+    # Parent team preference
     for doc in unassigned[:]:
         team = parent_map.get(doc)
         if team in REQUIRED and len(teams[team]) < REQUIRED[team]:
             teams[team].append(doc)
             unassigned.remove(doc)
 
-    # Fill remaining minimums
+    # Fill required slots
     for team, need in REQUIRED.items():
         while len(teams[team]) < need and unassigned:
             teams[team].append(unassigned.pop(0))
 
-    # Distribute extras to least-filled teams
+    # Distribute extras
     while unassigned:
         team_to_fill = min(teams.items(), key=lambda kv: len(kv[1]))[0]
         teams[team_to_fill].append(unassigned.pop(0))
 
-    # Locum only if under threshold
+    # Locum requirement
     locum_required = {}
     if len(names) < LOCUM_THRESHOLD:
         for team, need in REQUIRED.items():
@@ -102,10 +104,7 @@ def assign_for_day(avail_names, parent_map):
     return dict(teams), locum_required
 
 def process_rota(xlsx_bytes):
-    try:
-        df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_NAME, dtype=str)
-    except Exception as e:
-        raise ValueError(f"Failed to read Excel or sheet '{SHEET_NAME}': {e}")
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_NAME, dtype=str)
     parent_map = extract_parent_team_map(df)
     work = build_working_rota(df)
 
@@ -116,32 +115,34 @@ def process_rota(xlsx_bytes):
         result[day] = {"Teams": teams, "Locum Required": locum}
     return result
 
+# --- Main handler ---
 def handler(request):
     if request.method == "GET":
+        # Health check
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps({"ok": True, "endpoint": "rota"})
         }
 
-    if request.method != "POST":
-        return {"statusCode": 405, "body": "Method Not Allowed"}
-
-    data = _read_bytes(request)
-    if not data:
-        return {
-            "statusCode": 400,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": "No Excel bytes received"})
-        }
-
     try:
-        result = process_rota(data)
+        file = request.files.get("file") if hasattr(request, "files") else None
+        if not file:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": "No file uploaded"})
+            }
+
+        xlsx_bytes = file.read()
+        result = process_rota(xlsx_bytes)
+
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps(result)
         }
+
     except Exception as e:
         return {
             "statusCode": 500,
